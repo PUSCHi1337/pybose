@@ -1,0 +1,10 @@
+# Isolated unit-test environment; not the production runtime requirements.
+cryptography==50.0.2
+PyJWT==2.15.1
+pytest==9.2.0
+pytest-asyncio==1.4.1
+pytest-socket==0.8.1
+pytest-timeout==2.4.0
+requests==2.34.2
+websockets==14.2
+zeroconf==0.151.5
