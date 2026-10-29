@@ -16,6 +16,7 @@ import logging
 from ssl import SSLContext, CERT_NONE, PROTOCOL_TLS_CLIENT
 import websockets
 from threading import Event
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Union
 from pybose.BoseAuth import BoseAuth
 
@@ -124,6 +125,10 @@ JWT_NOT_BEFORE_RETRY_DELAY = 2
 # stops waiting for its response after this many seconds instead of forever.
 DEFAULT_REQUEST_TIMEOUT = 30
 
+# Fork change by PUSCHi1337, 2026-10-29: bound retries per speaker instance.
+RECONNECT_INITIAL_DELAY = 1
+RECONNECT_MAX_DELAY = 60
+
 
 class BoseSpeaker:
     def __init__(
@@ -158,33 +163,118 @@ class BoseSpeaker:
         self._bose_auth: BoseAuth = bose_auth
         self._on_exception = on_exception
         self._connected = False
+        self._connect_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._disconnect_lock = asyncio.Lock()
+        self._disconnecting = False
+        self._retry_at = 0.0
+        self._reconnect_delay = RECONNECT_INITIAL_DELAY
 
     async def connect(self) -> None:
-        """Connect to the WebSocket and start the receiver loop."""
-        await self.disconnect()
-        self._websocket = await websockets.connect(
-            self._url, subprotocols=[self._subprotocol], ssl=self._ssl_context
-        )
-        _LOGGER.info("WebSocket connection established.")
-        self._stop_event.clear()
-        self._receiver_task = asyncio.create_task(self._receiver_loop())
-        if self._subscribed_resources:
-            _LOGGER.debug("Subscribing to resources from previous session.")
-            await self.subscribe(self._subscribed_resources)
-        await self.get_capabilities()
-        self._connected = True
+        """Share one connection handshake across concurrent callers."""
+        if self._disconnecting:
+            raise ConnectionError("Speaker disconnect is in progress.")
+        task = self._connect_task
+        if task is None or task.done():
+            if self._connected:
+                return
+            retry_after = self._retry_at - monotonic()
+            if retry_after > 0:
+                raise BoseConnectionBackoffError(retry_after)
+            self._stop_event.clear()
+            task = asyncio.create_task(self._connect_once())
+            self._connect_task = task
+            task.add_done_callback(self._observe_task)
+        # A cancelled polling caller must not cancel another caller's handshake.
+        await asyncio.shield(task)
+
+    @staticmethod
+    def _observe_task(task: asyncio.Task) -> None:
+        """Retrieve failures even when every waiting caller has been cancelled."""
+        if not task.cancelled():
+            task.exception()
+
+    async def _connect_once(self) -> None:
+        """Open one socket; handshake requests must never reenter connect()."""
+        try:
+            await self._close_connection()
+            self._websocket = await websockets.connect(
+                self._url, subprotocols=[self._subprotocol], ssl=self._ssl_context
+            )
+            self._receiver_task = asyncio.create_task(self._receiver_loop())
+            if self._subscribed_resources:
+                await self.subscribe(self._subscribed_resources)
+            await self.get_capabilities()
+            if self._receiver_task.done():
+                raise ConnectionError("Speaker disconnected during the handshake.")
+            self._connected = True
+            self._retry_at = 0.0
+            self._reconnect_delay = RECONNECT_INITIAL_DELAY
+            _LOGGER.info("WebSocket connection established.")
+        except asyncio.CancelledError:
+            await self._close_connection()
+            raise
+        except Exception:
+            self._retry_at = monotonic() + self._reconnect_delay
+            self._reconnect_delay = min(
+                self._reconnect_delay * 2, RECONNECT_MAX_DELAY
+            )
+            await self._close_connection()
+            raise
+
+    async def _close_connection(self) -> None:
+        """Close the owned transport and await its sole receiver."""
+        self._connected = False
+        receiver = self._receiver_task
+        current = asyncio.current_task()
+        if receiver and receiver is not current and not receiver.done():
+            receiver.cancel()
+        try:
+            if self._websocket:
+                await self._websocket.close()
+        finally:
+            if receiver and receiver is not current:
+                await asyncio.gather(receiver, return_exceptions=True)
 
     async def disconnect(self) -> None:
-        """Stop the receiver loop and close the WebSocket connection."""
-        self._stop_event.set()
-        # Close the socket first: the receiver loop is blocked in recv() and only returns once the connection is gone.
-        if self._websocket:
-            await self._websocket.close()
-        current_task = asyncio.current_task()
-        if self._receiver_task and self._receiver_task != current_task:
-            await self._receiver_task
-        _LOGGER.info("WebSocket connection closed.")
-        self._connected = False
+        """Cancel pending recovery and close the receiver and transport."""
+        async with self._disconnect_lock:
+            self._disconnecting = True
+            self._stop_event.set()
+            try:
+                current = asyncio.current_task()
+                pending = [
+                    task for task in (self._reconnect_task, self._connect_task)
+                    if task and task is not current and not task.done()
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                await self._close_connection()
+                _LOGGER.info("WebSocket connection closed.")
+            finally:
+                self._disconnecting = False
+
+    def _schedule_reconnect(self) -> None:
+        """Schedule at most one observed recovery attempt after receiver exit."""
+        if (not self._auto_reconnect or self._stop_event.is_set()
+                or self._disconnecting
+                or (self._connect_task and not self._connect_task.done())
+                or (self._reconnect_task and not self._reconnect_task.done())):
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
+        self._reconnect_task.add_done_callback(self._observe_task)
+
+    async def _reconnect(self) -> None:
+        try:
+            await self.connect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            _LOGGER.warning("Automatic speaker reconnect failed: %s", ex)
+            if self._on_exception:
+                self._on_exception(ex)
 
     def attach_receiver(self, callback: Callable[[BR.BoseMessage], None]) -> int:
         """Attach a callback to receive unsolicited messages."""
@@ -244,26 +334,27 @@ class BoseSpeaker:
                 f"Waiting for deviceID. Queued message: {json.dumps(message, indent=4)}"
             )
         else:
-            try:
-                await self._websocket.send(json.dumps(message))
-            except websockets.ConnectionClosed:
-                self._connected = False
-                if self._auto_reconnect:
-                    _LOGGER.warning(
-                        "WebSocket connection is closed. Reconnecting before sending message."
-                    )
+            in_handshake = asyncio.current_task() is self._connect_task
+            if (not in_handshake and self._connect_task
+                    and not self._connect_task.done()):
+                await self.connect()
+            if self._websocket is None:
+                if in_handshake or not self._auto_reconnect or self._stop_event.is_set():
+                    raise ConnectionError("Speaker is disconnected.")
+                await self.connect()
+            # Retry a failed send once, sharing recovery with every other caller.
+            for attempt in range(2):
+                socket = self._websocket
+                try:
+                    await socket.send(json.dumps(message))
+                    break
+                except websockets.ConnectionClosed:
+                    if socket is self._websocket:
+                        self._connected = False
+                    if (in_handshake or attempt or not self._auto_reconnect
+                            or self._stop_event.is_set()):
+                        raise
                     await self.connect()
-                    await self._websocket.send(json.dumps(message))
-                else:
-                    _LOGGER.error(
-                        "WebSocket connection is closed. Cannot send message."
-                    )
-                    ex = Exception(
-                        "WebSocket connection is closed. Cannot send message."
-                    )
-                    if self._on_exception:
-                        self._on_exception(ex)
-                    raise ex
 
             _LOGGER.debug(f"Sent message: {json.dumps(message, indent=4)}")
 
@@ -355,10 +446,12 @@ class BoseSpeaker:
 
     async def _receiver_loop(self) -> None:
         """Continuously receive and process messages from the WebSocket."""
+        socket = self._websocket
         try:
             while not self._stop_event.is_set():
-                message = await self._websocket.recv()
-                self._connected = True
+                message = await socket.recv()
+                if socket is not self._websocket:
+                    return
                 _LOGGER.debug(f"Received message: {message}")
                 parsed_message: BR.BoseMessage = json.loads(message)
                 header: BR.BoseHeader = parsed_message.get("header", {})
@@ -373,7 +466,7 @@ class BoseSpeaker:
                     while not self._message_queue.empty():
                         queued_msg = await self._message_queue.get()
                         queued_msg["header"]["device"] = self._device_id
-                        await self._websocket.send(json.dumps(queued_msg))
+                        await socket.send(json.dumps(queued_msg))
                 if (
                     header.get("msgtype") == BR.BoseHeaderMsgTypeEnum.RESPONSE
                     and header.get("reqID") is not None
@@ -384,18 +477,16 @@ class BoseSpeaker:
                     for receiver in self._receivers.values():
                         receiver(parsed_message)
         except websockets.ConnectionClosed:
-            if self._stop_event.is_set():
-                # Closed by disconnect(); do not treat it as a lost connection.
+            if self._stop_event.is_set() or socket is not self._websocket:
                 return
+            self._connected = False
             _LOGGER.warning("WebSocket connection lost.")
-            if self._auto_reconnect:
-                _LOGGER.info("Reconnecting...")
-                asyncio.create_task(self.connect())
-            else:
-                _LOGGER.error("WebSocket connection closed.")
+            self._schedule_reconnect()
         except Exception as e:
-            if not self._stop_event.is_set():
-                _LOGGER.error(f"Error in receiver loop: {e}")
+            if not self._stop_event.is_set() and socket is self._websocket:
+                self._connected = False
+                _LOGGER.error("Error in receiver loop: %s", e)
+                self._schedule_reconnect()
 
     async def get_capabilities(self) -> BR.Capabilities:
         """Retrieve the device capabilities."""
@@ -737,6 +828,14 @@ class BoseSpeaker:
         return await self._request(
             "/cast/setup" if enable else "/cast/teardown", "PUT", body
         )
+
+
+class BoseConnectionBackoffError(ConnectionError):
+    """A previous connection failed; retry after the per-speaker cooldown."""
+
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"Speaker reconnect cooldown: retry in {retry_after:.2f}s.")
 
 
 class BoseFunctionNotSupportedException(Exception):
