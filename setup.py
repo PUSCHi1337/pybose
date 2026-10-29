@@ -1,7 +1,7 @@
 import os
 from setuptools import setup, find_packages
 
-version = os.getenv("PACKAGE_VERSION", "0.0.0")
+version = os.getenv("PACKAGE_VERSION", "2026.10.2.post1")
 
 setup(
     name="pybose",
@@ -9,12 +9,10 @@ setup(
     description="An unofficial Python API for controlling Bose soundbars and speakers.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    author="cavefire",
-    author_email="timo@cavefire.net",
+    author="pybose contributors",
     maintainer="PUSCHi1337",
     url="https://github.com/PUSCHi1337/pybose",
     project_urls={
-        "Upstream": "https://github.com/cavefire/pybose",
         "Fork changes": "https://github.com/PUSCHi1337/pybose/pulls",
     },
     packages=find_packages(),

@@ -166,6 +166,7 @@ class BoseSpeaker:
         self._connect_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
         self._disconnect_lock = asyncio.Lock()
+        self._address_lock = asyncio.Lock()
         self._disconnecting = False
         self._retry_at = 0.0
         self._reconnect_delay = RECONNECT_INITIAL_DELAY
@@ -187,6 +188,22 @@ class BoseSpeaker:
             task.add_done_callback(self._observe_task)
         # A cancelled polling caller must not cancel another caller's handshake.
         await asyncio.shield(task)
+
+    async def reconnect(self, host: Optional[str] = None) -> None:
+        """Reconnect without replacing the client or its registered callbacks.
+
+        A changed address closes the previous transport first. At the same
+        address, concurrent attempts and retry cooldown remain owned by connect().
+        """
+        async with self._address_lock:
+            if host is not None and host != self._host:
+                await self.disconnect()
+                self._host = host
+                self._url = (
+                    f"wss://{self._host}:8082/"
+                    "?product=Madrid-iOS:31019F02-F01F-4E73-B495-B96D33AD3664"
+                )
+            await self.connect()
 
     @staticmethod
     def _observe_task(task: asyncio.Task) -> None:
