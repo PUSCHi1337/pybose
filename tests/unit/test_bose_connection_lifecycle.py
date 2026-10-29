@@ -453,3 +453,75 @@ async def test_disabled_recovery_keeps_the_request_exception_callback(monkeypatc
         assert connector.calls == 0
         assert len(failures) == 1
         assert isinstance(failures[0], websockets.ConnectionClosed)
+
+
+@pytest.mark.asyncio
+async def test_address_change_preserves_client_callbacks(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        urls = []
+        original_connect = connector.__call__
+
+        async def record_url(url, **kwargs):
+            urls.append(url)
+            return await original_connect(url, **kwargs)
+
+        monkeypatch.setattr(module.websockets, "connect", record_url)
+        messages = []
+        speaker.attach_receiver(messages.append)
+        await speaker.connect()
+        old = speaker._websocket
+        await speaker.reconnect(host="new-address.invalid")
+        assert len(urls) == 2
+        assert urls[1].startswith("wss://new-address.invalid:8082/")
+        assert old.closed and old.readers == 0
+        await speaker._websocket.incoming.put(json.dumps({
+            "header": {"msgtype": "NOTIFY"}, "body": {"migrated": True},
+        }))
+        await asyncio.sleep(0)
+        assert messages[0]["body"] == {"migrated": True}
+        assert speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_same_address_reconnect_reuses_ready_transport(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        socket = speaker._websocket
+        await speaker.reconnect(host="offline.invalid")
+        assert connector.calls == 1
+        assert speaker._websocket is socket
+        assert not socket.closed
+
+
+@pytest.mark.asyncio
+async def test_same_address_reconnect_keeps_offline_cooldown(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.connect()
+        with pytest.raises(ConnectionError):
+            await speaker.reconnect(host="offline.invalid")
+        assert connector.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_address_changes_share_one_new_connection(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        await asyncio.gather(*(speaker.reconnect(host="new-address.invalid")
+                               for _ in range(10)))
+        assert connector.calls == 2
+        assert sum(not socket.closed for socket in connector.sockets) == 1
+        assert all(socket.peak_readers == 1 for socket in connector.sockets)
+
+
+@pytest.mark.asyncio
+async def test_failed_address_change_leaves_no_live_old_receiver(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        old = speaker._websocket
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.reconnect(host="new-address.invalid")
+        assert old.closed and old.readers == 0
+        assert not speaker.is_connected()
