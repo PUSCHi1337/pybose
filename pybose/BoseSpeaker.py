@@ -348,11 +348,13 @@ class BoseSpeaker:
                 try:
                     await socket.send(json.dumps(message))
                     break
-                except websockets.ConnectionClosed:
+                except websockets.ConnectionClosed as ex:
                     if socket is self._websocket:
                         self._connected = False
                     if (in_handshake or attempt or not self._auto_reconnect
                             or self._stop_event.is_set()):
+                        if not self._auto_reconnect and self._on_exception:
+                            self._on_exception(ex)
                         raise
                     await self.connect()
 
