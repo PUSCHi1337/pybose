@@ -1,12 +1,47 @@
-# Unofficial Bose API for Soundbars and Speakers
+# pybose — experimental stability fork
 
-[![Python Tests](https://github.com/cavefire/pybose/actions/workflows/python-tests.yml/badge.svg)](https://github.com/cavefire/pybose/actions/workflows/python-tests.yml)
+> Fork maintained by [PUSCHi1337](https://github.com/PUSCHi1337), based on
+> [cavefire/pybose](https://github.com/cavefire/pybose).
+> Fork modifications dated 2026-10-28 and 2026-10-29 are developed with AI assistance.
+> The upstream authorship, copyright notices and [GNU GPLv3 license](LICENSE) are retained.
+> This is not an official Bose product or an upstream release.
+
+## Fork development status
+
+This development branch includes the discovery cleanup from [draft PR #1](https://github.com/PUSCHi1337/pybose/pull/1)
+and the connection lifecycle work in [draft PR #2](https://github.com/PUSCHi1337/pybose/pull/2).
+The latter shares concurrent connection attempts, avoids recursive reconnects during
+the handshake, observes background failures and adds a per-speaker retry cooldown
+of 1, 2, 4, 8, 16, 32 and then at most 60 seconds after failed handshakes.
+One automatic recovery attempt is made after a connection loss; subsequent explicit
+calls or polling can retry after the cooldown. A successful handshake resets it.
+Calls during cooldown raise `BoseConnectionBackoffError` (a `ConnectionError`)
+with a `retry_after` value. Concurrent calls share a handshake; cancelling one
+waiter leaves it running, while `disconnect()` cancels it and awaits cleanup.
+
+The fork CI runs simulated unit tests with network sockets blocked. It does not
+test real Bose logins, device compatibility or long-running Home Assistant use,
+and it does not establish the cause of a NAS crash. Consult the linked PR checks
+for the exact tested commit. No fork release or Home Assistant installation
+package is available. The integration's token-task lifecycle and stale entity
+client references remain separate work in the
+[companion integration fork](https://github.com/PUSCHi1337/Bose-Homeassistant).
+Its mDNS monitor is not changed by this library patch, and a newly created client
+has its own cooldown state.
+
+The device lists, API descriptions and examples below originate from the upstream
+project. They describe upstream functionality, not hardware tests of this fork.
+Discuss fork-specific changes in the relevant fork PR; upstream maintainers are
+not responsible for this experimental branch.
+
+
+[![Python Tests](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml/badge.svg?branch=fix%2Fconnection-lifecycle)](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml)
 
 This Python project provides an unofficial API to control Bose Soundbars and Speakers locally. The API was reverse-engineered by analyzing the Bose app's API calls and is **not officially supported by Bose**. It allows users to interact with their Bose devices through local network communication and provides a basic feature set for device control.
 
-Also check out my Homeassistant integration: [Bose-Homeassistant](https://github.com/cavefire/Bose-Homeassistant)
+Original author's Home Assistant integration: [Bose-Homeassistant](https://github.com/cavefire/Bose-Homeassistant)
 
-### Tested Devices
+### Devices reported as tested by upstream
 - Bose Soundbar Ultra
 - Bose Soundbar 900
 - Bose Music Amplifier
@@ -17,7 +52,9 @@ Other Bose devices may also work, but they have not been tested.
 
 ---
 
-## Installation
+## Upstream installation reference
+
+The command below installs the upstream PyPI package. It does **not** install this fork's draft fixes.
 
 ```bash
 pip install pybose
@@ -28,7 +65,7 @@ pip install pybose
 ### BoseAuth
 BOSE decided that in order to control your devices locally (!) you still need to acquire a token from their cloud. This is done by using the `BoseAuth` class. 
 
-Sadly there is no official documentation about this (at least none I could find), so I had to reverse engineer the API calls the official app makes. 
+Sadly there is no official documentation about this (at least none reported by upstream), so the upstream author reverse-engineered the API calls made by the official app. 
 
 **Note:** The token is a JWT with a limited lifetime and needs to be refreshed manually. Consider caching the token to reduce API calls.
 
@@ -147,14 +184,14 @@ python -m pytest tests/unit/ --cov=pybose --cov-report=xml --cov-report=json --c
 This project is a work in progress, and contributions are welcome!
 If you encounter issues, have feature requests, or want to contribute, feel free to submit a pull request or open an issue.
 
-The file `AvailableMethods.txt` contains a list of all available `resources` I could find.
-Best way to find out, what data these functions need, is to use the official app and sniff the network traffic. I used `Proxymon` for this. There should be a websocket connection to `ws://<device_ip>:8082` which contains all the data you need.
+The upstream file `AvailableMethods.txt` lists the discovered `resources`.
+Best way to find out, what data these functions need, is to use the official app and sniff the network traffic. The upstream author used `Proxymon` for this. There should be a websocket connection to `ws://<device_ip>:8082` which contains all the data you need.
 
 ## Wishlist
 
-The first item on my wishlist is a **Homeassistant** integration. I am currently working on this here: [Bose-Homeassistant](https://github.com/cavefire/Bose-Homeassistant)
+The upstream author's **Home Assistant** integration is available here: [Bose-Homeassistant](https://github.com/cavefire/Bose-Homeassistant)
 
-**Other items on my wishlist:**
+**Upstream wishlist:**
 
 - [x] Implement token refresh
 - [x] Implement groups
@@ -164,7 +201,7 @@ The first item on my wishlist is a **Homeassistant** integration. I am currently
 - [x] Implement bass module settings
 - [x] Implement surround speaker settings
 
-And lastly, a way to not use the BOSE cloud at all would be nice. But I am not sure, if this is possible at all.
+And lastly, a way to not use the BOSE cloud at all would be nice. Upstream has not established whether this is possible.
 
 ## Disclaimer
 This project is not affiliated with Bose Corporation. The API is reverse-engineered and may break at any time. Use at your own risk.
@@ -172,7 +209,7 @@ This project is not affiliated with Bose Corporation. The API is reverse-enginee
 **Be respectful and avoid spamming the API with unnecessary requests to ensure this project remains functional for everyone.**
 
 
-**To the BOSE legal team:**
+**Original author's note to the BOSE legal team (retained from cavefire's README):**
 
 All API keys used in this project are publicly available on the Bose website.
 

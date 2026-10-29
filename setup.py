@@ -11,7 +11,12 @@ setup(
     long_description_content_type="text/markdown",
     author="cavefire",
     author_email="timo@cavefire.net",
-    url="https://github.com/cavefire/pybose",
+    maintainer="PUSCHi1337",
+    url="https://github.com/PUSCHi1337/pybose",
+    project_urls={
+        "Upstream": "https://github.com/cavefire/pybose",
+        "Fork changes": "https://github.com/PUSCHi1337/pybose/pulls",
+    },
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
