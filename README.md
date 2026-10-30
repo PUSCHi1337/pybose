@@ -5,24 +5,27 @@ Python library for local control of Bose smart soundbars and speakers.
 Forked from [cavefire/pybose](https://github.com/cavefire/pybose).
 The original copyright and [GNU GPLv3 license](LICENSE) remain in effect.
 Fork changes are maintained by [PUSCHi1337](https://github.com/PUSCHi1337),
-dated 2026-10-28/29 and developed with AI assistance. This project is
+dated 2026-10-28 through 2026-10-30 and developed with AI assistance. This project is
 unofficial and is not affiliated with Bose Corporation.
 
-## Development status
+## Current state
 
-The development branch combines discovery resource cleanup with coordinated
-WebSocket reconnects. Changes are tracked in [PR #1](https://github.com/PUSCHi1337/pybose/pull/1)
+This fork contains discovery resource cleanup, coordinated WebSocket reconnects,
+IPv6 address handling and prompt transport-loss notifications. The implementation
+and review history are tracked in [PR #1](https://github.com/PUSCHi1337/pybose/pull/1)
 and [PR #2](https://github.com/PUSCHi1337/pybose/pull/2).
 
-[![Offline unit tests](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml/badge.svg?branch=fix%2Fconnection-lifecycle)](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml)
+[![Offline unit tests](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml/badge.svg?branch=main)](https://github.com/PUSCHi1337/pybose/actions/workflows/python-tests.yml)
 
 The tests use simulated sockets and discovery objects. They do not prove hardware
-compatibility, long-term Home Assistant stability or the cause of a NAS hang.
-See each PR's checks for the exact tested commit.
+compatibility or long-term Home Assistant stability. The baseline passes 174 unit
+tests on both Python 3.12 and 3.14; CI also checks workflow syntax and builds the
+wheel and source distribution. See each PR's checks for exact source references.
 
 The companion integration is [PUSCHi1337/Bose-Homeassistant](https://github.com/PUSCHi1337/Bose-Homeassistant).
 No release of this fork has been published to PyPI. A plain
-`pip install pybose` does not install these fork changes.
+`pip install pybose` does not install these fork changes. The HA integration pins
+an immutable source commit; it does not follow a moving branch.
 
 ## Connection and cleanup behavior
 
@@ -40,6 +43,21 @@ No release of this fork has been published to PyPI. A plain
 - `await speaker.reconnect(host=new_address)` changes address on the same client,
   retaining all callbacks. At the same address it preserves connection sharing
   and the existing cooldown.
+
+- IPv4, DNS names and bracketed IPv6 addresses are supported for WebSocket URLs.
+- Connection listeners publish transport edges and can be detached on shutdown.
+- A local response timeout is `BoseRequestTimeoutError` (both a request exception
+  and `TimeoutError`). It marks the established transport disconnected and releases
+  pending requests. A real speaker response with status 408 remains a response
+  error and is not reclassified as a local timeout.
+- Expected network absence is DEBUG; unexpected recovery/receiver failures remain visible.
+
+## Distribution preparation
+
+The manual **Prepare library distributions** workflow builds reviewable wheel
+and source archives on GitHub. No workflow in this fork uploads packages to PyPI
+or automatically creates/deletes releases. Publishing a fork package requires a
+separate release decision and an appropriate package name.
 
 ## Authentication and use
 
