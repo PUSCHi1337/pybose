@@ -1,7 +1,7 @@
 import os
 from setuptools import setup, find_packages
 
-version = os.getenv("PACKAGE_VERSION", "2026.10.2.post1")
+version = os.getenv("PACKAGE_VERSION", "2026.10.2.post2")
 
 setup(
     name="pybose",
