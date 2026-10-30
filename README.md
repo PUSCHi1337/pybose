@@ -22,6 +22,11 @@ compatibility or long-term Home Assistant stability. The baseline passes 174 uni
 tests on both Python 3.12 and 3.14; CI also checks workflow syntax and builds the
 wheel and source distribution. See each PR's checks for exact source references.
 
+The first GitHub preview is [v2026.10.2.post2](https://github.com/PUSCHi1337/pybose/releases/tag/v2026.10.2.post2).
+It publishes the reviewed source with pre-release status; it is not a PyPI upload.
+Home Assistant users should install the companion integration, which manages
+the matching library automatically.
+
 The companion integration is [PUSCHi1337/Bose-Homeassistant](https://github.com/PUSCHi1337/Bose-Homeassistant).
 No release of this fork has been published to PyPI. A plain
 `pip install pybose` does not install these fork changes. The HA integration pins
