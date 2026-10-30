@@ -35,6 +35,9 @@ class FakeServiceBrowser:
         for handler in handlers:
             handler(zeroconf, service_type, "FakeService", ServiceStateChange.Added)
 
+    def cancel(self):
+        """Match the cleanup API; this fake has no background resources."""
+
 # Test _resolve_service: when service info is returned, the device should be added.
 def test_resolve_service_success():
     fake_info = FakeServiceInfo(guid=b"test-guid", addresses=["192.168.1.100"])

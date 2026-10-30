@@ -4,6 +4,8 @@ BoseDiscovery Module
 This module provides functionality to discover Bose devices on the local network using Zeroconf.
 It scans for devices broadcasting the "_bose-passport._tcp.local." service and extracts key
 information such as the device GUID and IP address.
+
+Modified 2026-10-28: cancel discovery browsers and respect Zeroconf ownership.
 """
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange
@@ -33,6 +35,7 @@ class BoseDiscovery:
         Args:
             zeroconf (Optional[Zeroconf]): An optional Zeroconf instance to use.
         """
+        self._owns_zeroconf = zeroconf is None
         if zeroconf is None:
             zeroconf = Zeroconf()
         self.zeroconf = zeroconf
@@ -79,7 +82,9 @@ class BoseDiscovery:
         Discover Bose devices advertising the "_bose-passport._tcp.local." service.
 
         This method initializes the devices list, creates a ServiceBrowser to listen for
-        service events, waits for a given timeout period, and then closes the Zeroconf instance.
+        service events and waits for a given timeout period. The browser is always
+        cancelled afterwards. Only a Zeroconf instance created by this object is
+        closed; a caller-provided instance remains available to its owner.
 
         Args:
             timeout (int): Time in seconds to wait for service discovery. Defaults to 5.
@@ -90,12 +95,17 @@ class BoseDiscovery:
         """
         self.devices = []
 
-        # Create a ServiceBrowser that listens for service events and calls _on_service_state_change.
-        listener = ServiceBrowser(self.zeroconf, "_bose-passport._tcp.local.", handlers=[self._on_service_state_change])
-
+        listener = None
         try:
+            # Keep browser creation inside the cleanup scope in case it fails.
+            listener = ServiceBrowser(self.zeroconf, "_bose-passport._tcp.local.", handlers=[self._on_service_state_change])
             time.sleep(timeout)
         finally:
-            self.zeroconf.close()
+            try:
+                if listener is not None:
+                    listener.cancel()
+            finally:
+                if self._owns_zeroconf:
+                    self.zeroconf.close()
 
         return self.devices

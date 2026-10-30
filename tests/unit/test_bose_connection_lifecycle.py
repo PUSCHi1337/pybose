@@ -1,0 +1,657 @@
+"""Offline regressions for connection ownership; added by PUSCHi1337, 2026-10-29."""
+import asyncio
+import importlib
+import json
+from contextlib import asynccontextmanager
+
+import pytest
+import websockets
+
+from pybose.BoseAuth import BoseAuth
+from pybose.BoseSpeaker import BoseSpeaker
+
+module = importlib.import_module("pybose.BoseSpeaker")
+CLOSED = object()
+
+
+class Socket:
+    def __init__(self, fail_resource=None):
+        self.incoming = asyncio.Queue()
+        self.closed = False
+        self.close_code = None
+        self.fail_resource = fail_resource
+        self.readers = 0
+        self.peak_readers = 0
+        self.sent = []
+
+    async def send(self, data):
+        message = json.loads(data)
+        resource = message["header"]["resource"]
+        if self.closed or resource == self.fail_resource:
+            await self.close()
+            raise websockets.ConnectionClosedOK(None, None)
+        self.sent.append(resource)
+        await self.incoming.put(json.dumps({
+            "header": {
+                "msgtype": "RESPONSE", "reqID": message["header"]["reqID"],
+                "status": 200, "resource": resource,
+            },
+            "body": {"group": []} if resource == "/system/capabilities" else {"ok": True},
+        }))
+
+    async def recv(self):
+        self.readers += 1
+        self.peak_readers = max(self.peak_readers, self.readers)
+        try:
+            if self.readers > 1:
+                raise RuntimeError("two receivers on one socket")
+            item = await self.incoming.get()
+            if item is CLOSED:
+                raise websockets.ConnectionClosedOK(None, None)
+            return item
+        finally:
+            self.readers -= 1
+
+    async def close(self):
+        self.closed = True
+        self.close_code = 1000
+        for _ in range(max(1, self.readers)):
+            await self.incoming.put(CLOSED)
+
+
+class Connector:
+    def __init__(self):
+        self.calls = 0
+        self.sockets = []
+        self.offline = False
+        self.gate = None
+        self.fail_resource = None
+
+    async def __call__(self, *args, **kwargs):
+        self.calls += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        await asyncio.sleep(0)
+        if self.offline:
+            raise OSError("simulated offline speaker")
+        socket = Socket(self.fail_resource)
+        self.sockets.append(socket)
+        return socket
+
+
+@asynccontextmanager
+async def rig(monkeypatch):
+    auth = BoseAuth()
+    auth.set_access_token("dummy", "dummy", "dummy")
+    speaker = BoseSpeaker("offline.invalid", device_id="dummy", bose_auth=auth,
+                          request_timeout=0.2)
+    speaker.has_capability = lambda resource: True
+    connector = Connector()
+    monkeypatch.setattr(module.websockets, "connect", connector)
+    try:
+        yield speaker, connector
+    finally:
+        await asyncio.wait_for(speaker.disconnect(), 1)
+        for socket in connector.sockets:
+            await socket.close()
+        await asyncio.sleep(0)
+
+
+async def started(connector):
+    async def wait():
+        while connector.calls == 0:
+            await asyncio.sleep(0)
+    await asyncio.wait_for(wait(), 1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_connects_share_one_socket_and_receiver(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        results = await asyncio.wait_for(asyncio.gather(
+            *(speaker.connect() for _ in range(20)), return_exceptions=True), 2)
+        assert not [r for r in results if isinstance(r, BaseException)]
+        assert connector.calls == 1
+        assert max(s.peak_readers for s in connector.sockets) == 1
+        assert speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_recover_a_closed_socket_once(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        speaker._websocket = Socket()
+        await speaker._websocket.close()
+        results = await asyncio.wait_for(asyncio.gather(*(
+            speaker._request("/dummy", "GET", waitForResponse=False)
+            for _ in range(20)), return_exceptions=True), 2)
+        assert not [r for r in results if isinstance(r, BaseException)]
+        assert connector.calls == 1
+        assert connector.sockets[0].sent.count("/dummy") == 20
+        assert connector.sockets[0].peak_readers == 1
+
+
+@pytest.mark.asyncio
+async def test_receiver_and_request_share_recovery(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        old = speaker._websocket
+        await old.close()
+        await asyncio.sleep(0)
+        result = await asyncio.wait_for(
+            speaker._request("/dummy", "GET", waitForResponse=False), 2)
+        assert result == {}
+        assert connector.calls == 2
+        assert speaker.is_connected()
+        assert all(s.peak_readers == 1 for s in connector.sockets)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["/system/capabilities", "/subscription"])
+async def test_handshake_send_failure_does_not_reenter_connect(monkeypatch, resource):
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.fail_resource = resource
+        if resource == "/subscription":
+            speaker._subscribed_resources = ["/dummy"]
+        result = (await asyncio.gather(
+            asyncio.wait_for(speaker.connect(), 0.8), return_exceptions=True))[0]
+        assert isinstance(result, websockets.ConnectionClosed)
+        assert connector.calls == 1
+        assert all(s.closed and s.readers == 0 for s in connector.sockets)
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_offline_attempts_have_exponential_capped_cooldown(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0], raising=False)
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.offline = True
+        delay = 1
+        for expected_calls in range(1, 10):
+            with pytest.raises(OSError, match="simulated offline"):
+                await speaker.connect()
+            assert connector.calls == expected_calls
+            for _ in range(10):
+                with pytest.raises(ConnectionError):
+                    await speaker.connect()
+            assert connector.calls == expected_calls
+            clock[0] += delay - 0.01
+            with pytest.raises(ConnectionError):
+                await speaker.connect()
+            assert connector.calls == expected_calls
+            clock[0] += 0.01
+            delay = min(delay * 2, 60)
+
+
+@pytest.mark.asyncio
+async def test_success_resets_the_offline_cooldown(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0], raising=False)
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.connect()
+        clock[0] += 1
+        connector.offline = False
+        await speaker.connect()
+        await speaker.disconnect()
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.connect()
+        clock[0] += 1
+        connector.offline = False
+        await speaker.connect()
+        assert connector.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_background_reconnect_failure_is_observed_once(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        failures = []
+        speaker._on_exception = failures.append
+        await speaker.connect()
+        connector.offline = True
+        await speaker._websocket.close()
+        await asyncio.sleep(0.05)
+        assert connector.calls == 2
+        assert len(failures) == 1
+        assert isinstance(failures[0], OSError)
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_auto_reconnect_disabled_reports_disconnected(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        speaker._auto_reconnect = False
+        await speaker.connect()
+        await speaker._websocket.close()
+        await asyncio.sleep(0.05)
+        assert connector.calls == 1
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_an_inflight_connection(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.gate = asyncio.Event()
+        waiter = asyncio.create_task(speaker.connect())
+        await started(connector)
+        await speaker.disconnect()
+        connector.gate.set()
+        result = (await asyncio.gather(waiter, return_exceptions=True))[0]
+        assert isinstance(result, asyncio.CancelledError)
+        assert not speaker.is_connected()
+        assert not connector.sockets
+
+
+@pytest.mark.asyncio
+async def test_disconnect_does_not_reconnect_and_closes_receiver(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        socket = speaker._websocket
+        receiver = speaker._receiver_task
+        await speaker.disconnect()
+        await asyncio.sleep(0.05)
+        assert connector.calls == 1
+        assert receiver.done()
+        assert socket.closed and socket.readers == 0
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_connect_on_a_ready_connection_is_idempotent(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        socket = speaker._websocket
+        await speaker.connect()
+        assert connector.calls == 1
+        assert speaker._websocket is socket
+        assert not socket.closed
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_waiter_preserves_the_shared_connection(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.gate = asyncio.Event()
+        first = asyncio.create_task(speaker.connect())
+        await started(connector)
+        second = asyncio.create_task(speaker.connect())
+        await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        connector.gate.set()
+        await asyncio.wait_for(second, 1)
+        assert connector.calls == 1
+        assert speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_request_waits_for_handshake_before_using_socket(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = speaker.get_capabilities
+
+        async def delayed_capabilities():
+            entered.set()
+            await release.wait()
+            return await original()
+
+        monkeypatch.setattr(speaker, "get_capabilities", delayed_capabilities)
+        connecting = asyncio.create_task(speaker.connect())
+        await asyncio.wait_for(entered.wait(), 1)
+        request = asyncio.create_task(speaker._request("/dummy", "GET",
+                                                      waitForResponse=False))
+        await asyncio.sleep(0.02)
+        assert "/dummy" not in connector.sockets[0].sent
+        release.set()
+        await asyncio.wait_for(asyncio.gather(connecting, request), 1)
+        assert connector.calls == 1
+        assert "/dummy" in connector.sockets[0].sent
+
+
+@pytest.mark.asyncio
+async def test_second_send_failure_is_not_retried_forever(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        speaker._websocket = Socket()
+        await speaker._websocket.close()
+        connector.fail_resource = "/dummy"
+        with pytest.raises(websockets.ConnectionClosed):
+            await asyncio.wait_for(speaker._request("/dummy", "GET",
+                                                   waitForResponse=False), 1)
+        assert connector.calls == 1
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_stale_receiver_cannot_update_the_replacement_connection(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        old = Socket()
+        speaker._websocket = old
+        messages = []
+        speaker.attach_receiver(messages.append)
+        receiver = asyncio.create_task(speaker._receiver_loop())
+        await asyncio.sleep(0)
+        replacement = Socket()
+        speaker._websocket = replacement
+        speaker._connected = False
+        await old.incoming.put(json.dumps({"header": {}, "body": {"stale": True}}))
+        await old.close()
+        await asyncio.wait_for(receiver, 0.5)
+        assert not speaker.is_connected()
+        assert messages == []
+        assert connector.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_handshake_response_timeout_closes_the_receiver(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        original_connect = connector.__call__
+
+        async def connect_without_responses(*args, **kwargs):
+            socket = await original_connect(*args, **kwargs)
+
+            async def silent_send(data):
+                socket.sent.append(json.loads(data)["header"]["resource"])
+
+            socket.send = silent_send
+            return socket
+
+        monkeypatch.setattr(module.websockets, "connect", connect_without_responses)
+        with pytest.raises(module.BoseRequestException) as failure:
+            await asyncio.wait_for(speaker.connect(), 1)
+        assert failure.value.http_status == 408
+        assert connector.calls == 1
+        assert connector.sockets[0].closed
+        assert connector.sockets[0].readers == 0
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_background_recovery(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        connector.gate = asyncio.Event()
+        await speaker._websocket.close()
+
+        async def recovery_started():
+            while connector.calls < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(recovery_started(), 1)
+        await speaker.disconnect()
+        connector.gate.set()
+        await asyncio.sleep(0.02)
+        assert connector.calls == 2
+        assert len(connector.sockets) == 1
+        assert connector.sockets[0].closed
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restores_subscriptions_and_existing_callbacks(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        messages = []
+        speaker.attach_receiver(messages.append)
+        await speaker.connect()
+        await speaker.subscribe(["/dummy"])
+        await speaker._websocket.close()
+        await asyncio.sleep(0)
+        await speaker.connect()
+        assert connector.calls == 2
+        replacement = connector.sockets[-1]
+        assert "/subscription" in replacement.sent
+        await replacement.incoming.put(json.dumps({
+            "header": {"msgtype": "NOTIFY"}, "body": {"fresh": True},
+        }))
+        await asyncio.sleep(0)
+        assert len(messages) == 1
+        assert messages[0]["body"] == {"fresh": True}
+
+
+@pytest.mark.asyncio
+async def test_late_send_failure_does_not_replace_a_recovered_socket(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        old = speaker._websocket
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        old_send = old.send
+
+        async def delayed_send(data):
+            if json.loads(data)["header"]["resource"] == "/slow":
+                entered.set()
+                await release.wait()
+                raise websockets.ConnectionClosedOK(None, None)
+            return await old_send(data)
+
+        old.send = delayed_send
+        request = asyncio.create_task(speaker._request("/slow", "GET",
+                                                      waitForResponse=False))
+        await asyncio.wait_for(entered.wait(), 1)
+        await old.close()
+        await asyncio.sleep(0)
+        await speaker.connect()
+        replacement = speaker._websocket
+        release.set()
+        await asyncio.wait_for(request, 1)
+        assert connector.calls == 2
+        assert speaker._websocket is replacement
+        assert speaker.is_connected()
+        assert not replacement.closed
+
+
+@pytest.mark.asyncio
+async def test_disabled_recovery_keeps_the_request_exception_callback(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        speaker._auto_reconnect = False
+        failures = []
+        speaker._on_exception = failures.append
+        speaker._websocket = Socket()
+        await speaker._websocket.close()
+        with pytest.raises(websockets.ConnectionClosed):
+            await speaker._request("/dummy", "GET", waitForResponse=False)
+        assert connector.calls == 0
+        assert len(failures) == 1
+        assert isinstance(failures[0], websockets.ConnectionClosed)
+
+
+@pytest.mark.asyncio
+async def test_address_change_preserves_client_callbacks(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        urls = []
+        original_connect = connector.__call__
+
+        async def record_url(url, **kwargs):
+            urls.append(url)
+            return await original_connect(url, **kwargs)
+
+        monkeypatch.setattr(module.websockets, "connect", record_url)
+        messages = []
+        speaker.attach_receiver(messages.append)
+        await speaker.connect()
+        old = speaker._websocket
+        await speaker.reconnect(host="new-address.invalid")
+        assert len(urls) == 2
+        assert urls[1].startswith("wss://new-address.invalid:8082/")
+        assert old.closed and old.readers == 0
+        await speaker._websocket.incoming.put(json.dumps({
+            "header": {"msgtype": "NOTIFY"}, "body": {"migrated": True},
+        }))
+        await asyncio.sleep(0)
+        assert messages[0]["body"] == {"migrated": True}
+        assert speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_same_address_reconnect_reuses_ready_transport(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        socket = speaker._websocket
+        await speaker.reconnect(host="offline.invalid")
+        assert connector.calls == 1
+        assert speaker._websocket is socket
+        assert not socket.closed
+
+
+@pytest.mark.asyncio
+async def test_same_address_reconnect_keeps_offline_cooldown(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.connect()
+        with pytest.raises(ConnectionError):
+            await speaker.reconnect(host="offline.invalid")
+        assert connector.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_address_changes_share_one_new_connection(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        await asyncio.gather(*(speaker.reconnect(host="new-address.invalid")
+                               for _ in range(10)))
+        assert connector.calls == 2
+        assert sum(not socket.closed for socket in connector.sockets) == 1
+        assert all(socket.peak_readers == 1 for socket in connector.sockets)
+
+
+@pytest.mark.asyncio
+async def test_failed_address_change_leaves_no_live_old_receiver(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        old = speaker._websocket
+        connector.offline = True
+        with pytest.raises(OSError):
+            await speaker.reconnect(host="new-address.invalid")
+        assert old.closed and old.readers == 0
+        assert not speaker.is_connected()
+
+
+# Power-cycle and address regressions, 2026-10-30. Documentation-only hosts.
+@pytest.mark.parametrize("host,parsed_host", [
+    ("192.0.2.10", "192.0.2.10"),
+    ("speaker.invalid", "speaker.invalid"),
+    ("2001:db8::20", "2001:db8::20"),
+    ("[2001:db8::20]", "2001:db8::20"),
+])
+def test_speaker_uri_preserves_ipv4_dns_and_ipv6_authorities(host, parsed_host):
+    from websockets.uri import parse_uri
+    speaker = BoseSpeaker(host)
+    uri = parse_uri(speaker._url)
+    assert uri.host == parsed_host
+    assert uri.port == 8082
+
+
+@pytest.mark.asyncio
+async def test_reconnect_builds_a_valid_ipv6_authority(monkeypatch):
+    from websockets.uri import parse_uri
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        await speaker.reconnect(host="2001:db8::21")
+        assert parse_uri(speaker._url).host == "2001:db8::21"
+        assert connector.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_local_response_timeout_marks_transport_unavailable(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        speaker._auto_reconnect = False
+        async def silent_send(data):
+            pass
+        speaker._websocket.send = silent_send
+        with pytest.raises(module.BoseRequestException) as failure:
+            await speaker._request("/dummy", "GET", timeout=0.02)
+        assert isinstance(failure.value, TimeoutError)
+        assert failure.value.http_status == 408
+        assert not speaker.is_connected()
+
+
+@pytest.mark.asyncio
+async def test_closed_transport_releases_pending_response_without_full_timeout(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        speaker._auto_reconnect = False
+        sent = asyncio.Event()
+        async def silent_send(data):
+            sent.set()
+        socket = speaker._websocket
+        socket.send = silent_send
+        request = asyncio.create_task(speaker._request("/dummy", "GET", timeout=5))
+        try:
+            await asyncio.wait_for(sent.wait(), 1)
+            await socket.close()
+            with pytest.raises(ConnectionError):
+                await asyncio.wait_for(request, 0.4)
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_connection_listeners_observe_edges_and_detach(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        changes = []
+        listener_id = speaker.attach_connection_listener(changes.append)
+        await speaker.connect()
+        await speaker.connect()
+        await speaker.disconnect()
+        assert changes == [True, False]
+        speaker.detach_connection_listener(listener_id)
+        await speaker.connect()
+        await speaker.disconnect()
+        assert changes == [True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,expected_warning", [
+    (ConnectionRefusedError(111, "speaker is offline"), False),
+    (ValueError("malformed speaker handshake"), True),
+])
+async def test_recovery_keeps_real_errors_visible_but_quiets_normal_absence(
+    monkeypatch, caplog, failure, expected_warning
+):
+    async with rig(monkeypatch) as (speaker, connector):
+        failures = []
+        speaker._on_exception = failures.append
+        async def fails():
+            raise failure
+        monkeypatch.setattr(speaker, "connect", fails)
+        with caplog.at_level("WARNING", logger=module.__name__):
+            await speaker._reconnect()
+        assert failures == [failure]
+        assert bool([r for r in caplog.records if r.name == module.__name__
+                     and r.levelno >= 30]) is expected_warning
+
+
+@pytest.mark.asyncio
+async def test_ordinary_socket_loss_is_quiet_and_still_updates_availability(monkeypatch, caplog):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        speaker._auto_reconnect = False
+        with caplog.at_level("WARNING", logger=module.__name__):
+            await speaker._websocket.close()
+            await asyncio.wait_for(speaker._receiver_task, 0.4)
+        assert not speaker.is_connected()
+        assert not [r for r in caplog.records if r.name == module.__name__
+                    and r.levelno >= 30]
+
+
+@pytest.mark.asyncio
+async def test_remote_408_remains_a_real_response_error(monkeypatch):
+    async with rig(monkeypatch) as (speaker, connector):
+        await speaker.connect()
+        socket = speaker._websocket
+        async def rejects(data):
+            request = json.loads(data)
+            await socket.incoming.put(json.dumps({
+                "header": {"msgtype": "RESPONSE",
+                           "reqID": request["header"]["reqID"], "status": 408},
+                "error": {"code": 408, "message": "remote endpoint rejected the request"},
+                "body": {},
+            }))
+        socket.send = rejects
+        with pytest.raises(module.BoseRequestException) as failure:
+            await speaker._request("/dummy", "GET")
+        assert not isinstance(failure.value, TimeoutError)
+        assert speaker.is_connected()
